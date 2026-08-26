@@ -168,6 +168,15 @@ func (fs *FilerServer) copy(ctx context.Context, w http.ResponseWriter, r *http.
 		preserveDestinationMetadataForDataCopy(existingDstEntry, newEntry)
 	}
 
+	// The chunks above were placed under the destination's storage option, so the
+	// entry has to carry its TTL and not the source's (or, for a data-only copy,
+	// the destination's older one) - otherwise the entry and its data expire apart.
+	newEntry.TtlSec = so.TtlSeconds
+	if _, err = fs.applyStorageDefaultsToEntry(ctx, newEntry); err != nil {
+		writeJsonError(w, r, http.StatusInsufficientStorage, err)
+		return
+	}
+
 	// Pass o_excl = !overwrite so the default copy refuses to replace an
 	// existing destination, while overwrite=true updates the pre-created target.
 	if createErr := fs.filer.CreateEntry(ctx, newEntry, nil, !overwrite, false, nil, false, fs.filer.MaxFilenameLength); createErr != nil {

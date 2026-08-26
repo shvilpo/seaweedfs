@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
@@ -53,6 +55,73 @@ func TestObjectTransactionPutAppliesRuleTtl(t *testing.T) {
 	}
 
 	entry, err := store.FindEntry(context.Background(), ttlRulePrefix+"obj")
+	if err != nil {
+		t.Fatalf("FindEntry: %v", err)
+	}
+	if entry.TtlSec != 180 {
+		t.Errorf("entry TtlSec = %d, want 180", entry.TtlSec)
+	}
+}
+
+// A copy landing in a TTL path re-uploads its chunks under that path's rule, so
+// the entry has to carry the rule's TTL too.
+func TestCopyAppliesRuleTtl(t *testing.T) {
+	store := newRenameTestStore()
+	source := newFileEntry("/src.txt", 11)
+	source.Content = []byte("hello")
+	store.entries["/src.txt"] = source
+	store.entries[ttlRulePrefix] = newDirectoryEntry(ttlRulePrefix, 10)
+
+	server := &FilerServer{
+		filer:          newRenameTestFiler(t, store),
+		option:         &FilerOption{},
+		entryLockTable: util.NewLockTable[util.FullPath](),
+	}
+	addTtlRule(t, server.filer)
+
+	req := httptest.NewRequest(http.MethodPost, ttlRulePrefix+"dst.txt?cp.from=/src.txt", http.NoBody)
+	rec := httptest.NewRecorder()
+	server.copy(context.Background(), rec, req, &operation.StorageOption{MaxFileNameLength: 255})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("copy = %d, want %d; body=%q", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+
+	entry, err := store.FindEntry(context.Background(), ttlRulePrefix+"dst.txt")
+	if err != nil {
+		t.Fatalf("FindEntry: %v", err)
+	}
+	if entry.TtlSec != 180 {
+		t.Errorf("entry TtlSec = %d, want 180", entry.TtlSec)
+	}
+}
+
+// A source carrying its own TTL must not keep it at a destination whose rule
+// says otherwise: the copied chunks were placed under the destination's option,
+// so an entry on the source's TTL would expire apart from its data.
+func TestCopyOverridesSourceTtlWithRule(t *testing.T) {
+	store := newRenameTestStore()
+	source := newFileEntry("/src.txt", 11)
+	source.Content = []byte("hello")
+	source.TtlSec = 600
+	source.Crtime = time.Now() // a TTL entry older than its TTL reads back as expired
+	store.entries["/src.txt"] = source
+	store.entries[ttlRulePrefix] = newDirectoryEntry(ttlRulePrefix, 10)
+
+	server := &FilerServer{
+		filer:          newRenameTestFiler(t, store),
+		option:         &FilerOption{},
+		entryLockTable: util.NewLockTable[util.FullPath](),
+	}
+	addTtlRule(t, server.filer)
+
+	req := httptest.NewRequest(http.MethodPost, ttlRulePrefix+"dst.txt?cp.from=/src.txt", http.NoBody)
+	rec := httptest.NewRecorder()
+	server.copy(context.Background(), rec, req, &operation.StorageOption{MaxFileNameLength: 255, TtlSeconds: 180})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("copy = %d, want %d; body=%q", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+
+	entry, err := store.FindEntry(context.Background(), ttlRulePrefix+"dst.txt")
 	if err != nil {
 		t.Fatalf("FindEntry: %v", err)
 	}
